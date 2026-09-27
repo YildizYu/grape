@@ -188,6 +188,7 @@ robot:
     cp: 0                       # 过渡百分比 0 = 精确停点
     approach_offset_m: [0.0, 0.0, 0.05]    # 接近点 = 目标点 + 该偏移 (base 系, 米)
     place_offset_m: [0.0, 0.0, 0.08]       # 放果点 = 目标点 + 该偏移
+    retract_offset_m: [0.0, 0.10, 0.0]     # 回退途经点 = 剪切点 + 该偏移 (话题模式: 合剪后先回退避开枝条, 再平移放果; z 保持剪切高度; 全零 = 关闭)
     # ⚠ 固定放果点 [x,y,z,rx,ry,rz] (mm / 度, base 系, 夹爪工具中心 TCP 位姿):
     #   现场示教后填入。fill 之后:
     #     - send_via_topic=true  → 自动 "发布该点 → 延时 open_delay_s → 开剪放果"
@@ -196,8 +197,10 @@ robot:
     place_position_mm: [-445.5, -385.8, 219.6, -87.9, -1.8, 135.1]  # 2026-09-20 现场示教 (由 Link6 实测位姿换算: P_tcp = P_link6 + R@gripper_offset)
     use_dynamic_orientation: true   # 三点动态姿态开关; 方向点不稳定(姿态乱跳 180°)时改回 false, 用下方示教固定角
     send_via_topic: true            # true = PICK 只发布 /target_pose (MoveIt 侧执行), 不调 DOBOT MovL
-    home_pose_xyz_m: [-0.1062439659, -0.3269769317, 0.2125605949]   # U 键回初始位置 (m), 2026-09-20 现场示教 (Link6 原始位姿, u 键直接发布无补偿)
-    home_quat_xyzw: [0.0537016493, -0.6778901034, 0.7329068113, -0.0207061954]  # [qx,qy,qz,qw] 2026-09-20 现场示教
+    home_pose_xyz_m: [-0.1069, -0.4037, 0.2322]   # U 键回初始位置 (m), 2026-09-27 现场示教 (executeGoal 实测位姿, u 键直接发布无补偿)
+    home_quat_xyzw: [-0.0536890806, 0.8220777285, -0.5668145996, 0.0051865857]  # [qx,qy,qz,qw] 2026-09-27 现场示教 rpy=(-110.97, -3.00, -174.59) deg → RzRyRx
+    stow_pose_xyz_m: [-0.1197, -0.3092, 0.1591]   # 回仓位 (m): Drive 0x83 发送后底盘行驶期间机械臂回此位 (2026-09-27 现场示教, Link6 原始位姿)
+    stow_quat_xyzw: [-0.0406232471, 0.7130018252, -0.6999727600, 0.0040353833]  # [qx,qy,qz,qw] rpy=(-91.15, -2.93, -176.35) deg → RzRyRx
     end_pose_rx_deg: -95.3782   # 末端姿态 (base 系 Rz·Ry·Rx 固定轴, 现场示教后填)
     end_pose_ry_deg: -1.1156
     end_pose_rz_deg: 145.5442
