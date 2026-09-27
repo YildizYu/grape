@@ -1,0 +1,236 @@
+# ============================================================
+# 葡萄果梗三维定位实时融合 Pipeline 配置
+# ============================================================
+
+# 注意: 本文件位于 DOBOT 工作区内, 目录为
+#   /home/user/DOBOT_6Axis_ROS2_V4-main/grape_stem_3d_zed_deploy/
+# 相对路径均以该目录为基准解析。
+
+# ── 相机配置 (ZED X Mini) ──────────────────────────────────
+camera:
+  model: ZED X Mini
+  # 输出分辨率 — 与 D435i 版保持一致的 640×480 接口
+  color_width: 640
+  color_height: 480
+  color_fps: 30
+  depth_width: 640
+  depth_height: 480
+  depth_fps: 30
+  # ZED 原生采集参数 (ZED X Mini 仅支持以下分辨率, 不支持 HD720/VGA)
+  zed_resolution: HD1200       # HD1200(1920×1200) / HD1080(1920×1080) / HD2K(2208×1242)
+  zed_depth_mode: NEURAL       # NEURAL / NEURAL_PLUS / QUALITY / ULTRA / PERFORMANCE
+  zed_depth_min_m: 0.15        # 4mm 镜头 0.15m / 2.2mm 镜头 0.1m
+  zed_depth_max_m: 8.0         # 4mm 镜头 12m / 2.2mm 镜头 8m
+  # 相机故障检测 (协议 v2.0 FAIL_CAMERA 上报)
+  read_fail_threshold: 10      # 连续读帧失败 N 次 → 上报 FAIL_CAMERA (0x06)
+  read_fail_sleep_s: 0.1       # 读失败时睡眠, 防止主循环高速空转
+
+# ── 模型配置 ──────────────────────────────────────────────
+models:
+  grapes_weights: weights/grapes/best.pt
+  stem_weights: weights/stem/best.pt
+  sam_type: sam3
+  sam_checkpoint: weights/sam/model.pt
+  device: "0"
+
+# ── 视觉链选择 ────────────────────────────────────────────
+# sam3_keypoint: 葡萄 YOLO → 果梗 YOLO → SAM3 → 骨架 P1/CUT/P3
+vision:
+  chain: sam3_keypoint
+
+# ── SAM3 与正式主链共用的 mask 后处理 ────────────────────
+mask_postprocess:
+  pose_offset: 10.0          # CUT 到 P1/P3 的测地距离 (224 坐标空间)
+  min_component_area: 5      # 连通域最小像素数 (12→5: 细果梗不再被过滤)
+  min_path_length: 10.0      # 骨架最小路径长度 (20→10: 短果梗不再被过滤)
+  fill_invalid_with_cut: true  # P1/P3 深度无效时用 CUT 深度回填
+
+# ── 葡萄检测器参数 ────────────────────────────────────────
+grapes_detector:
+  confidence: 0.25
+  iou: 0.50
+  imgsz: 640
+
+# ── ROI 扩展参数 ──────────────────────────────────────────
+roi:
+  expand_left: 0.15
+  expand_right: 0.15
+  expand_top: 0.50
+  expand_bottom: 0.10
+
+# ── 果梗检测器参数 ────────────────────────────────────────
+stem_detector:
+  confidence: 0.08        # 果梗 YOLO 置信度 (0.15→0.08: 降低漏检)
+  iou: 0.50
+  imgsz: 960
+
+# ── 果梗候选选择参数 ──────────────────────────────────────
+stem_selection:
+  confidence_weight: 0.60
+  position_weight: 0.40
+
+# ── SAM 参数 ──────────────────────────────────────────────
+sam:
+  box_padding: 0.15
+  minimum_mask_area: 20
+
+# ── SAM3 常驻子进程（使用当前 ZED 终端环境）──────────────
+sam3_runtime:
+  worker_python: /home/user/miniconda3/envs/sam3/bin/python3
+  worker_script: src/grape_stem_3d/sam3_mask_worker.py
+  sam3_source_dir: "../sam3"     # 优化/微调后的 SAM3 代码目录 (相对 grape_stem_3d_zed_deploy; 原版在 third_party/sam3)
+  ready_timeout_s: 900.0
+  job_timeout_s: 120.0
+
+# ── 深度采样参数 ──────────────────────────────────────────
+depth:
+  min_m: 0.15   # ZED X Mini 最小深度 (4mm 镜头; 2.2mm 镜头可设 0.1)
+  max_m: 8.0    # ZED X Mini 最大深度 (4mm 镜头可设 12)
+  patch_radius: 3
+  tolerance_abs_m: 0.02
+  tolerance_relative: 0.03
+  min_center_neighbors: 3
+  search_radius: 12
+  minimum_valid_pixels: 3
+  use_mask_only: true
+  estimator: median
+  depth_scale: 1.0  # ZED 输出 float32 米, 无需缩放
+
+# ── 运行时参数 ────────────────────────────────────────────
+runtime:
+  detect_every_n_frames: 1
+  display: true
+  save_on_key: true
+  warmup: true
+
+# ── 自动采摘 (与 d/g 按键并存, 不需要时 enabled: false) ──
+auto_pick:
+  enabled: true               # true: 仅在初始位置附近每 interval_s 自动检测, 目标在机械臂最大工作位点内自动采摘
+  interval_s: 0.5             # 自动检测周期 (秒)
+  max_base_radius_m: 1.2      # 目标距 base 原点最大距离 (米), 超出不触发 — 按 CR5 最大工作位点留余量, 宽松值
+  home_radius_m: 0.05         # 扫描门禁: 机械臂距 home 该半径内才扫描 (流程结束自动回 home, 到位后恢复)
+
+# ── PLC TCP 通信配置 (55 AA 协议 v2.0, 见 PLC_TCP_PROTOCOL.md) ──
+# 现场网段: PLC=192.168.0.11  mini box=192.168.0.10  机械臂=192.168.0.13
+plc:
+  enabled: true                 # 是否启用 PLC 通信 (false 时按键手动操作) — 现场已开
+  host: "192.168.0.11"             # PLC 服务器 IP (Box 作 TCP 客户端主动连接)
+                                # ⚠ 本机联调指向 plc_simulator 时同样用 --port 5000 对齐现场
+  port: 5001                   # PLC 服务器端口 (现场实测 5000)
+  reconnect_interval_s: 3.0     # 断线重连间隔 (秒)
+  status_interval_s: 1.0        # 心跳/状态周期上报间隔 (秒), PLC 看门狗建议 3 秒
+
+  # ── Drive 信号 (0x83): 本点位采完/无果 → 通知 PLC 驱动底盘换位 ──
+  # 触发: 累计 DONE done_threshold 次, 或连续 FAIL_NO_TARGET no_target_threshold 次;
+  # 发出后暂停计数与 auto_pick 自动扫描, 直到下一次 START (新点位)。
+  drive:
+    enabled: true              # 是否启用 0x83 Drive 信号 (现场开)
+    done_threshold: 5          # 累计 DONE N 次 → 发 Drive
+    no_target_threshold: 10    # 连续 FAIL_NO_TARGET N 次 → 发 Drive
+    retry_interval_s: 2.0      # 发出 Drive 后未收到 START: 每隔 N 秒补发一次 Drive
+
+# # ── 上位机 (HMI) TCP 服务配置 (55 AA 同帧协议, 见 PLC_TCP_PROTOCOL.md §8) ──
+# # 角色与 PLC 通道相反: Box 作 TCP 服务器监听, 上位机主动连接 192.168.0.10:5000
+# hmi:
+#   enabled: false                 # 是否启用上位机服务
+#   host: "0.0.0.0"               # 监听地址 (0.0.0.0 = 所有网卡; 若只允许 PLC 网段
+#                                 # 访问可改为 "192.168.0.10")
+#   port: 20001                    # 监听端口
+#   status_interval_s: 1.0        # 心跳/状态周期上报间隔 (秒)
+
+# ── 机械臂 (DOBOT CR5, 服务见 /dobot_bringup_ros2/srv/*) ──
+# ── MoveIt 目标位姿发布 (分层: 视觉 → target_pose_transformer → MoveIt) ──
+# 姿态来源声明: Position comes from vision;
+#              orientation uses predefined harvesting orientation (fixed_rpy_deg)
+target_pose:
+  camera_target_topic: "/grape_harvest/camera_target"  # run_grasp_pipeline 检测成功发布 (相机系 XYZ, 米)
+  target_pose_topic: "/grape_harvest/target_pose"      # grape_arm_control (MoveIt) 订阅
+  frame_id: "dummy_link"                              # MoveIt planning frame (getPlanningFrame 运行时实测=dummy_link;
+                                                      # dummy_joint 零偏移固定关节, 与 base_link 几何重合)
+  fixed_rpy_deg: [0.0, 0.0, 0.0]                       # 固定采摘姿态 (base 系 Rz·Ry·Rx 固定轴, 现场示教后填)
+  gripper_offset_m: [0.005, 0.0, 0.21]                  # 机械臂末端(Link6) → 夹爪工具中心点 平移 (Link6 系, 米)
+  pose_max_age_s: 2.0                                  # 机械臂位姿超龄判定
+  workspace_max_radius_m: 1.2                          # 目标超半径不发布 (CR5 工作半径 ~0.9m, 留余量)
+  handeye_yaml: "calibration/handeye_result.yaml"    # 默认取 robot.handeye_yaml
+
+# ── 夹爪 (剪刀手) 接近触发 (approach_monitor 节点) ──
+# 首次联调务必 dry_run: true, 验证链路后再改 false 接真实剪刀
+gripper:
+  dry_run: true                        # true: 只打 [GRIPPER] MOCK CLOSE 不碰硬件
+  close_distance_threshold_m: 0.03     # 距离阈值 (米, 30mm 起步, 现场按夹爪/定位精度标定)
+  approach_confirm_count: 3            # 连续 N 次位姿反馈满足阈值才触发 (防偶然扫过)
+  monitor_rate_hz: 10.0                # 距离监控频率
+  move_detect_eps_m: 0.001             # 相邻周期位姿变化 >1mm 视为机械臂开始运动
+  cut_timeout_s: 15.0                  # 合剪超时 (dry_run=false 时有效)
+
+robot:
+  enabled: true                 # false 或 --detect-only → 不调用任何机器人服务
+  service_prefix: "/dobot_bringup_ros2/srv"
+  wait_service_timeout_s: 10.0  # 启动时等待全部服务出现
+  service_timeout_s: 5.0        # 单次服务调用客户端超时 (bringup 内部无超时, 必须兜底)
+  service_fail_limit: 2         # 连续服务失败 N 次 → 视为机器人不可用
+  pose_topic: "/dobot_msgs_v4/msg/ToolVectorActual"   # x,y,z mm + rx,ry,rz 度 (TCP 位姿)
+  status_topic: "/dobot_msgs_v4/msg/RobotStatus"
+  pose_timeout_s: 2.0           # 位姿停更判定 (报 FAIL_NO_ROBOT_POSE)
+  max_reach_m: 0.9              # 目标距基座超出此半径直接拒绝 (CR5 工作半径边缘, 防远端 MovL→ERROR)
+  # 手眼标定: 55 组 TSAI tool 链 (P_base = T_base_tool @ T_tool_camera @ P_camera)
+  handeye_yaml: "calibration/handeye_result.yaml"
+  speed_factor: 50              # 启动时全局速率比 %, 现场按需调
+  motion:
+    frame_wait_timeout_s: 0.5   # 流程等新帧超时 (PICKING 中帧停更 → FAIL_CAMERA)
+    poll_interval_s: 0.1        # RobotMode 轮询周期 (ABORT 反应 ≤0.1s)
+    home_wait_timeout_s: 20.0   # 话题模式: 发布 home 后等机械臂回到初始位置的超时 (秒), 到位才报 DONE
+    timeout_s: 60.0             # 单段运动超时 → Stop + FAIL_ROBOT_MOTION
+    user_index: 0               # MovL 用户坐标系 (0 = 基座系)
+    tool_index: 0               # MovL 工具坐标系 (点位即 TCP 位姿)
+    speed_approach_mm_s: 200    # 接近/放果/退回段速度 (speed 数值优先于 v)
+    speed_grasp_mm_s: 60        # 抓取段速度 (临近果实减速)
+    cp: 0                       # 过渡百分比 0 = 精确停点
+    approach_offset_m: [0.0, 0.0, 0.05]    # 接近点 = 目标点 + 该偏移 (base 系, 米)
+    place_offset_m: [0.0, 0.0, 0.08]       # 放果点 = 目标点 + 该偏移
+    # ⚠ 固定放果点 [x,y,z,rx,ry,rz] (mm / 度, base 系, 夹爪工具中心 TCP 位姿):
+    #   现场示教后填入。fill 之后:
+    #     - send_via_topic=true  → 自动 "发布该点 → 延时 open_delay_s → 开剪放果"
+    #     - send_via_topic=false → MovL 放果点 (优先于 place_offset_m)
+    #   留空 (null): 话题模式跳过"运动到固定位置 → 开剪"段, 剪刀保持合剪。
+    place_position_mm: [-445.5, -385.8, 219.6, -87.9, -1.8, 135.1]  # 2026-09-20 现场示教 (由 Link6 实测位姿换算: P_tcp = P_link6 + R@gripper_offset)
+    use_dynamic_orientation: true   # 三点动态姿态开关; 方向点不稳定(姿态乱跳 180°)时改回 false, 用下方示教固定角
+    send_via_topic: true            # true = PICK 只发布 /target_pose (MoveIt 侧执行), 不调 DOBOT MovL
+    home_pose_xyz_m: [-0.1062439659, -0.3269769317, 0.2125605949]   # U 键回初始位置 (m), 2026-09-20 现场示教 (Link6 原始位姿, u 键直接发布无补偿)
+    home_quat_xyzw: [0.0537016493, -0.6778901034, 0.7329068113, -0.0207061954]  # [qx,qy,qz,qw] 2026-09-20 现场示教
+    end_pose_rx_deg: -95.3782   # 末端姿态 (base 系 Rz·Ry·Rx 固定轴, 现场示教后填)
+    end_pose_ry_deg: -1.1156
+    end_pose_rz_deg: 145.5442
+  scissors:
+    enable: true                # 剪刀手 Modbus 控制
+    port: "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"   # CH340 USB转485 直连串口 (by-id 路径不受 ttyUSB 编号漂移影响); 留空走机械臂末端 485 透传
+    slave_id: 1                 # RS485 从机地址
+    baud: 9600                  # N,8,1
+    reg_close: 1                # 0x01 电机运行 (写 close_val = 电机轴伸出合剪)
+    close_val: 4                # 合剪动作值 (协议: 值取 4)
+    reg_open: 10                # 0x0A 回原点 (写 1 = 电机轴缩回开剪)
+    reg_motion: 2               # 0x02 运动状态 (1=运动中, 0=停止)
+    reg_close_speed: 4          # 0x04 速度 (1-800 圈/min)
+    reg_stroke: 5               # 0x05 行程脉冲数 (9000 = 25mm 全行程, 厂家示例值)
+    close_speed_rpm: 300
+    stroke_pulses: 9000
+    cmd_delay_s: 0.2            # 官方建议: 发指令后延时再轮询 0x02
+    poll_interval_s: 0.05
+    cut_timeout_s: 15.0         # 合剪超时 → FAIL_CUT (先尽力开剪保安全)
+    open_timeout_s: 20.0        # 开剪超时 → 先回 home 再报 FAIL_CUT (2026-09-20: 全缩回实测可能远超 5s, 调大)
+    # ── send_via_topic 模式时序 (机械臂由 MoveIt 侧执行) ──
+    # 合剪前闭环到位判定 (替代原 close_delay_s 开环延时):
+    arrival_tolerance_m: 0.02   # TCP 距剪切点 ≤ 此值视为到位 (米)
+    arrival_timeout_s: 10.0     # 超时未到位 → FAIL_ROBOT_MOTION, 跳过合剪
+    close_delay_s: 2.5          # 已废弃 (到位判定取代, 保留兼容)
+    open_delay_s: 2.5           # 发布放果点后延时 N 秒再开剪 (等机械臂到位)
+
+# ── 输出配置 ──────────────────────────────────────────────
+output:
+  root: outputs
+  save_rgb: true
+  save_depth: true
+  save_mask: true
+  save_annotated: true
+  save_json: true
+  save_csv: true
