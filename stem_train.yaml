@@ -1,0 +1,22 @@
+# 果梗 YOLO 训练配置
+
+model: yolo11s.pt
+epochs: 200
+imgsz: 960
+batch: 8
+device: 0
+workers: 8
+patience: 50
+optimizer: AdamW
+lr0: 0.001
+weight_decay: 0.0005
+degrees: 5.0
+translate: 0.08
+scale: 0.30
+fliplr: 0.50
+flipud: 0.0
+mosaic: 0.20
+mixup: 0.0
+close_mosaic: 20
+seed: 42
+deterministic: true

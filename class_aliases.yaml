@@ -1,0 +1,41 @@
+# 类别别名映射配置
+# 用于 normalize_dataset_classes.py
+# 所有旧类别名称统一映射到标准类别
+
+grapes:
+  aliases:
+    - "0"
+    - "Grape 1"
+    - "Grape 3"
+    - "Grape 4"
+    - "Grape 5"
+    - "Grape"
+    - "grape"
+    - "grapes"
+    - "Grapes"
+    - "grape_bunch"
+    - "grape bunch"
+    - "grape-bunch"
+    - "bunch"
+    - "grapes_green"
+    - "grapes_purple"
+    - "grapes_unripe"
+    - "green"
+    - "purple"
+    - "unripe"
+
+stem:
+  aliases:
+    - "stem"
+    - "Stem"
+    - "grape_stem"
+    - "grape stem"
+    - "grape-stem"
+    - "peduncle"
+    - "Peduncle"
+    - "picking"
+
+# 标准类别 ID
+standard:
+  grapes: 0
+  stem: 1

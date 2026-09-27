@@ -1,0 +1,49 @@
+project_root: /home/user/grape/grape_stem_3d_zed_deploy
+
+classes:
+  grapes: 0
+  stem: 1
+
+roi:
+  expand_left: 0.15
+  expand_right: 0.15
+  expand_top: 0.50
+  expand_bottom: 0.10
+
+roi_jitter:
+  enabled: true
+  copies_per_grape: 2
+  center_shift_x: 0.08
+  center_shift_y: 0.08
+  scale_min: 0.90
+  scale_max: 1.15
+  top_expand_min: 0.40
+  top_expand_max: 0.80
+  seed: 42
+
+negative_samples:
+  enabled: true
+  target_ratio: 0.15
+
+grapes_detector:
+  weights: weights/grapes/best.pt
+  confidence: 0.25
+  iou: 0.50
+  imgsz: 640
+
+stem_detector:
+  weights: weights/stem/best.pt
+  confidence: 0.15
+  iou: 0.50
+  imgsz: 960
+
+sam:
+  type: sam2
+  checkpoint: weights/sam/model.pt
+  box_padding: 0.15
+
+output:
+  save_annotated: true
+  save_masks: true
+  save_json: true
+  save_csv: true
