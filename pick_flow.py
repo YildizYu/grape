@@ -691,13 +691,68 @@ class PickFlowController:
         R_target = rpy_degrees_to_rotation_matrix(rpy)
         link6_target = target - R_target @ self._gripper_offset_m
         deadline = time.time() + timeout_s
+        got_pose = 0
+        stale_cnt = 0
+        first_pos = None
+        last_pos = None
+        min_dist = None
         while time.time() < deadline:
             if self._abort_event.wait(poll):
                 return "aborted"
             T = self._robot.get_T_base_tool(max_age_s=2.0)
-            if T is not None and float(np.linalg.norm(T[:3, 3] - link6_target)) <= tol_m:
+            if T is None:
+                stale_cnt += 1
+                continue
+            got_pose += 1
+            pos = np.asarray(T[:3, 3], dtype=float)
+            if first_pos is None:
+                first_pos = pos.copy()
+            last_pos = pos.copy()
+            d = float(np.linalg.norm(pos - link6_target))
+            if min_dist is None or d < min_dist:
+                min_dist = d
+            if d <= tol_m:
                 return "arrived"
+        # 超时: 区分具体原因打印, 便于现场定位
+        if got_pose == 0:
+            reason = "全程未收到机械臂位姿 (位姿话题停更/机器人掉线)"
+        else:
+            moved_m = float(np.linalg.norm(last_pos - first_pos))
+            if moved_m < 0.005:
+                reason = (f"臂未动 (窗口内仅移动 {moved_m*1000:.0f}mm): "
+                          "规划/IK 失败或目标未被执行, 查 grape_arm_control 日志")
+            else:
+                reason = (f"臂在动但未入容差: 移动 {moved_m*1000:.0f}mm, "
+                          f"最近距目标 {min_dist*1000:.0f}mm > 容差 {tol_m*1000:.0f}mm "
+                          "(目标不可达/被挡/超时不足)")
+            reason += (f"; 实测终值=({last_pos[0]:.4f},{last_pos[1]:.4f},"
+                       f"{last_pos[2]:.4f})")
+        self._log(
+            f"[PICK] 到位等待超时 ({timeout_s:.0f}s): {reason}; "
+            f"期望 Link6=({link6_target[0]:.4f},{link6_target[1]:.4f},"
+            f"{link6_target[2]:.4f}); 位姿更新 {got_pose} 次 / 停更 {stale_cnt} 次"
+        )
         return "timeout"
+
+    def _wait_motion_started(self, from_pos, timeout_s: float = 5.0) -> None:
+        """轻量守卫: 等机械臂离开 from_pos (开始运动), 不判到位。
+
+        用途: 连续发布两个 /target_pose 时, grape_arm_control 只缓存最新
+        目标, 前一个未及时被消费会被覆盖丢弃; 观察到臂启动即说明前一个
+        目标已被执行, 此时发布下一个是安全的。超时仅记日志, 照常继续。
+        """
+        if self._robot is None:
+            return
+        poll = float(self._motion_cfg.get("poll_interval_s", 0.1))
+        ref = np.asarray(from_pos, dtype=float)
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self._abort_event.wait(poll):
+                return
+            T = self._robot.get_T_base_tool(max_age_s=2.0)
+            if T is not None and float(np.linalg.norm(T[:3, 3] - ref)) > 0.005:
+                return
+        self._log("[PICK] 回退后未观察到机械臂启动 (目标被覆盖/规划失败), 照常继续")
 
     # ── send_via_topic 模式时序: 发布位姿 → 到位判定合剪 → 固定点开剪 ──
     def _topic_pick_sequence(self, target_base, rpy) -> bool:
@@ -783,6 +838,29 @@ class PickFlowController:
             self._fail(plc.STATE_FAIL_CUT, "合剪失败, 需人工确认剪刀与果藤状态")
             return False
         self._log("[PICK] 合剪完成 (夹持中)")
+
+        # ── 回退途经点: 合剪后沿接近方向回退 retract_offset_m, ──
+        #    避开枝条再平移放果 (z 保持剪切高度, 姿态不变, 开环无到位判定)
+        retract = [float(v) for v in self._motion_cfg.get("retract_offset_m", [0.0, 0.0, 0.0])]
+        if any(retract):
+            retract_pose = (
+                target_base[0] + retract[0],
+                target_base[1] + retract[1],
+                target_base[2] + retract[2],
+            )
+            ref_pos = None
+            if self._robot is not None:
+                T = self._robot.get_T_base_tool(max_age_s=2.0)
+                if T is not None:
+                    ref_pos = np.asarray(T[:3, 3], dtype=float)
+            self._publish_target_pose(retract_pose, rpy)
+            self._log(
+                f"[PICK] 已发布回退途经点 /target_pose: 剪切点 + "
+                f"({retract[0]:.2f},{retract[1]:.2f},{retract[2]:.2f})m (开环, 无到位判定)"
+            )
+            # 轻量守卫: 等臂开始运动 (防止放果点发布过快覆盖回退目标)
+            if ref_pos is not None:
+                self._wait_motion_started(ref_pos)
 
         # ── 固定放果点 → 开剪 ──
         # ⚠ 固定位置待现场示教: 在 configs/fusion_pipeline.yaml 填

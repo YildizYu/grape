@@ -335,6 +335,7 @@ class Scissors485:
         abort_event: threading.Event,
         interval_s: float,
         start_grace_s: float,
+        require_active: bool = True,
     ) -> str:
         """轮询 0x02 直到剪刀停止（官方防呆: 发指令后延时再读）。
 
@@ -343,6 +344,11 @@ class Scissors485:
         一上来就读 0 说明电机从未起动 (指令未生效/无供电), 判 no_motion,
         避免"发出去就报成功"的假闭环。start_grace_s 内仍未观察到 1
         时提前判 no_motion, 不必等满整个超时窗口。
+
+        require_active=False (开剪回原点用): 本控制器固件在回原点过程中
+        不置 0x02 忙标志 (2026-09-27 实测 20ms 轮询全程为 0 而电机在动),
+        此时以"写成功 + 0x02 稳定为 0 满 start_grace_s"判完成;
+        读失败 (None) 不进入该分支, 仍不会误判成功。
         """
         deadline = time.time() + timeout_s
         start_deadline = time.time() + start_grace_s
@@ -357,7 +363,11 @@ class Scissors485:
                 return RESULT_DONE
             elif (busy == 0 and not seen_active
                   and time.time() >= start_deadline):
-                return RESULT_NO_MOTION
+                if require_active:
+                    return RESULT_NO_MOTION
+                self._log("[SCISSORS] 开剪: 未观察到 0x02 运动标志 "
+                          "(固件回原点不报忙), 稳定 0 判定完成")
+                return RESULT_DONE
             # busy=1 继续等; None 读失败重读（不计时重试）
             time.sleep(interval_s)
         return RESULT_TIMEOUT if seen_active else RESULT_NO_MOTION
