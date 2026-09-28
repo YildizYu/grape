@@ -248,8 +248,8 @@ class GraspPipelineNode(Node):
             f"{base_xyz[2]:.4f}) quat=({qx:.4f},{qy:.4f},{qz:.4f},{qw:.4f})"
         )
 
-    def publish_home_pose(self, xyz, quat_xyzw) -> None:
-        """回初始位置: 发布配置的 home 位姿 (x,y,z 米 + qx,qy,qz,qw) 到 /target_pose。"""
+    def _publish_raw_pose(self, xyz, quat_xyzw, tag: str) -> None:
+        """发布 Link6 原始位姿 (无补偿) 到 /target_pose, frame=dummy_link。"""
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "dummy_link"
@@ -263,10 +263,18 @@ class GraspPipelineNode(Node):
         msg.pose.orientation.w = qw
         self._target_pose_pub.publish(msg)
         self.get_logger().info(
-            f"已发布回初始位置 /target_pose: pos=({msg.pose.position.x:.4f},"
+            f"已发布{tag} /target_pose: pos=({msg.pose.position.x:.4f},"
             f"{msg.pose.position.y:.4f},{msg.pose.position.z:.4f}) "
             f"quat=({qx:.4f},{qy:.4f},{qz:.4f},{qw:.4f})"
         )
+
+    def publish_home_pose(self, xyz, quat_xyzw) -> None:
+        """回初始位置: 发布配置的 home 位姿 (x,y,z 米 + qx,qy,qz,qw) 到 /target_pose。"""
+        self._publish_raw_pose(xyz, quat_xyzw, "回初始位置")
+
+    def publish_stow_pose(self, xyz, quat_xyzw) -> None:
+        """回仓位置: 发布配置的 stow 位姿 (x,y,z 米 + qx,qy,qz,qw) 到 /target_pose。"""
+        self._publish_raw_pose(xyz, quat_xyzw, "回仓位置")
 
     # ── 状态查询 (UI) ────────────────────────────────
     @property
@@ -315,7 +323,7 @@ def classify_detection(
     )
 
     best_grape = None
-    best_conf = -1.0
+    best_conf = float("-inf")
 
     for grape in frame_result.get("grapes", []):
         if grape.get("status") != STATUS_SUCCESS:
@@ -327,11 +335,19 @@ def classify_detection(
         conf = grape.get("keypoint_path_length_224")
         if conf is None:
             conf = grape.get("stem_confidence", 0)
+        if grape.get("fallback"):
+            # 串顶兜底剪永远让位于同帧真实果梗检出 (无果梗时才兜底)
+            conf = -1.0
         if conf > best_conf:
             best_conf = conf
             best_grape = grape
 
     if best_grape is not None:
+        if best_grape.get("fallback"):
+            print(
+                f"  [PICK] 串顶兜底剪: grape_id={best_grape.get('grape_id')}, "
+                "无果梗三点 → 固定姿态"
+            )
         xyz = best_grape["peduncle_centroid_camera_xyz"]
         cut_info = None
         direction = best_grape.get("stem_direction_camera_xyz")
@@ -685,6 +701,19 @@ def main():
         [float(v) for v in _m_home["home_pose_xyz_m"]]
         if _m_home.get("home_pose_xyz_m") else None
     )
+    auto_home_quat = (
+        [float(v) for v in _m_home["home_quat_xyzw"]]
+        if _m_home.get("home_quat_xyzw") else None
+    )
+    stow_xyz = (
+        [float(v) for v in _m_home["stow_pose_xyz_m"]]
+        if _m_home.get("stow_pose_xyz_m") else None
+    )
+    stow_quat = (
+        [float(v) for v in _m_home["stow_quat_xyzw"]]
+        if _m_home.get("stow_quat_xyzw") else None
+    )
+    home_wait_timeout_s = float(_m_home.get("home_wait_timeout_s", 20.0))
 
     # 剪刀手时序提示 (现场核对: 合剪延时 + 固定放果点是否已示教)
     if robot is not None:
@@ -825,6 +854,21 @@ def main():
             ros_node.selected_target_base_xyz = None
         return frame_result, status, cam_xyz, base_xyz
 
+    def _arm_at_home() -> bool:
+        """机械臂当前 Link6 位姿距 home ≤ home_radius_m。
+
+        无机械臂/无 home 配置时恒 True (保持旧行为: 不设门禁)。
+        """
+        if robot is None or auto_home_xyz is None:
+            return True
+        T_cur = robot.get_T_base_tool(max_age_s=2.0)
+        if T_cur is None:
+            return False
+        d_home = float(np.linalg.norm(
+            np.asarray(T_cur[:3, 3], dtype=float)
+            - np.asarray(auto_home_xyz, dtype=float)))
+        return d_home <= auto_home_radius_m
+
     # 命令回调工厂（PLC/HMI 通道共用同一套处理逻辑, ACK 回到各自通道;
     # 回调运行在通信线程内: 只 ACK + 置标志, 重活由主循环执行）
     def _make_command_handler(sender):
@@ -893,9 +937,15 @@ def main():
         print(f"  HMI: {hmi_cfg.get('host')}:{hmi_port} (上位机连入收状态/发 START/ABORT)")
     print("=" * 50 + "\n")
 
+    # 程序启动自动回初始位置: 断电重启/ABORT 后残留任意位姿时兜底恢复
+    if robot is not None and auto_home_xyz is not None and auto_home_quat is not None:
+        ros_node.publish_home_pose(auto_home_xyz, auto_home_quat)
+        print("  启动: 已发布回初始位置 /target_pose (自动)")
+
     frame_result = None
     last_auto_check_t = 0.0
     last_auto_status = None
+    start_pending_deadline = None  # START 已收到、等机械臂回初始位后启动采摘 (None=无待启动)
 
     try:
         while rclpy.ok():
@@ -903,6 +953,7 @@ def main():
             # 【高-1】修复: 消费逻辑不依赖本帧读相机成功, 相机死时 ABORT 仍生效
             if plc_flags["abort"]:
                 plc_flags["abort"] = False
+                start_pending_deadline = None  # ABORT 取消待启动的采摘
                 busy_before = controller.is_busy
                 controller.abort()  # 内含立即 Stop 急停
                 if busy_before:
@@ -913,11 +964,23 @@ def main():
                     print("  [PLC] 收到 ABORT (空闲) → 上报 ABORTED")
             if plc_flags["start"]:
                 plc_flags["start"] = False
-                print("  [PLC] 收到 START，开始自动采摘流程")
-                if controller.start_pick():
-                    ros_node.state = STATE_PICKING
-                else:
-                    print("  [PLC] START 被拒（流程忙），ACK 已回 BUSY")
+                print("  [PLC] 收到 START → 机械臂先回初始位置, 到位后启动采摘")
+                if auto_home_xyz is not None and auto_home_quat is not None:
+                    ros_node.publish_home_pose(auto_home_xyz, auto_home_quat)
+                start_pending_deadline = time.time() + home_wait_timeout_s
+            if start_pending_deadline is not None and not controller.is_busy:
+                if _arm_at_home():
+                    start_pending_deadline = None
+                    print("  [PLC] 机械臂已回初始位置 → 启动采摘流程")
+                    if controller.start_pick():
+                        ros_node.state = STATE_PICKING
+                    else:
+                        print("  [PLC] START 被拒（流程忙），ACK 已回 BUSY")
+                elif time.time() > start_pending_deadline:
+                    start_pending_deadline = None
+                    print("  [PLC] 回初始位置超时 → 上报 FAIL_ROBOT_MOTION")
+                    drive_gate.send_status(plc.STATE_FAIL_ROBOT_MOTION)
+                    drive_gate.send_status(plc.STATE_IDLE)
 
             rgbd_frame = camera.read()
             if rgbd_frame is None:
@@ -1006,16 +1069,7 @@ def main():
                     last_auto_check_t = t_auto
                     # 位姿门禁: 距 home 超过 home_radius_m 不扫描, 避免
                     # 放果点/中途位置误触发 (回到 home 后扫描自动恢复)
-                    at_home = True
-                    if robot is not None and auto_home_xyz is not None:
-                        T_cur = robot.get_T_base_tool(max_age_s=2.0)
-                        if T_cur is None:
-                            at_home = False
-                        else:
-                            d_home = float(np.linalg.norm(
-                                np.asarray(T_cur[:3, 3], dtype=float)
-                                - np.asarray(auto_home_xyz, dtype=float)))
-                            at_home = d_home <= auto_home_radius_m
+                    at_home = _arm_at_home()
                     if not at_home:
                         if last_auto_status != "not_home":
                             last_auto_status = "not_home"
@@ -1048,6 +1102,11 @@ def main():
             elif drive_gate.driving and last_auto_status != "driving":
                 last_auto_status = "driving"
                 print("[AUTO] Drive 已发送, 自动扫描暂停, 等待 PLC START")
+                # Drive 后回仓: 底盘行驶期间机械臂回仓位置 (收到 START 再回初始位)
+                if (not controller.is_busy and robot is not None
+                        and stow_xyz is not None and stow_quat is not None):
+                    ros_node.publish_stow_pose(stow_xyz, stow_quat)
+                    print("  [AUTO] 已发布回仓位置 /target_pose (stow)")
             elif (not controller.is_busy and not drive_gate.started
                   and last_auto_status != "waiting_start"):
                 last_auto_status = "waiting_start"
