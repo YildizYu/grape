@@ -9,7 +9,11 @@ motion.send_via_topic=true 时机械臂交由 MoveIt 侧执行, 运动段换为
 (见 _topic_pick_sequence):
     发布 /target_pose ─► 延时 close_delay_s ─► CUT(合剪)
     ─► [place_position_mm 已示教] 发布放果点 ─► 延时 open_delay_s
-    ─► OPEN(开剪放果) ─► DONE ─► IDLE
+    ─► OPEN(开剪放果) ─► 发布 home 回初始位 ─► DONE ─► IDLE
+
+DONE 仅在完整流程 (合剪+放果+开剪) 全部完成且机械臂回到初始位后上报;
+缺失段一律 FAIL_CUT, 不空跑报 DONE (话题模式下剪刀未就绪仍发送
+接近/剪切位姿让臂走到目标, 供现场验证位姿链路, 但最终报 FAIL_CUT)。
 
 每个阻塞点三要素: 超时上限 + abort_event 检查 + 失败归类上报。
 任何路径（含异常）finally 中复位 busy, 保证可再次 START。
@@ -22,7 +26,8 @@ motion.send_via_topic=true 时机械臂交由 MoveIt 侧执行, 运动段换为
   无新帧即上报 FAIL_CAMERA（主循环侧的连续读失败计数另行处理）。
 - 运动超时/机器人 ERROR(9)/COLLISION(11): emergency_brake 后上报
   FAIL_ROBOT_MOTION；服务连续失败且位姿停更上报 FAIL_NO_ROBOT_POSE。
-- 剪刀超时: 尽力开剪（保安全）后上报 FAIL_CUT，需人工确认再继续。
+- 剪刀超时/状态不明: 尽力开剪（保安全）后上报 FAIL_CUT，需人工确认再继续;
+  合剪 no_motion (0x02 从未观察到运动) 判定剪刀未夹持, 跳过保安全开剪。
 - 剪刀状态判断: 合剪前读 0x02 确认空闲（busy/无响应 → FAIL_CUT 不盲目合剪）;
   合剪/开剪后必须观察到运动(1)→停止(0) 才判成功, 从未运动判 no_motion
   → FAIL_CUT（防"指令未生效却报 DONE"的假闭环）。
@@ -38,6 +43,7 @@ from typing import Callable, Optional, Tuple
 import numpy as np
 
 from grape_stem_3d import plc_comm as plc
+from grape_stem_3d.calculate_cut_pose import calculate_cut_pose
 from grape_stem_3d.cut_pose import (
     calculate_target_pose,
     rotation_matrix_to_rpy_degrees,
@@ -298,19 +304,21 @@ class PickFlowController:
                 if (cut_info is not None
                         and self._motion_cfg.get("use_dynamic_orientation", True)):
                     try:
-                        # 三点直接用相机系坐标 (keypoint 输出), 在相机系里算 roll,
-                        # 下方再乘 R_base_camera 转到基系
-                        p_up = cut_info["p_up_camera"]
-                        p_cut = cut_info["p_cut_camera"]
-                        p_down = cut_info["p_down_camera"]
-                        # 当前工具姿态 (仅日志): T_base_tool 的旋转部分 = 工具轴
-                        # 在基系下的表示, ZYX 约定与 DOBOT MovL 一致。
-                        # 注意: 简化版 calculate_target_pose 不使用 current_rpy
-                        # (参数仅为接口兼容保留); 若恢复完整版三维计算, 此处需
-                        # 改为相机系臂姿 rpy(T_tool_camera[:3,:3].T)。
+                        # 三点先转到基系 (现场版: 计算与日志都在基系进行)
+                        p_up = camera_to_base_link(
+                            cut_info["p_up_camera"], self._T_tool_camera, T_base_tool
+                        )
+                        p_cut = camera_to_base_link(
+                            cut_info["p_cut_camera"], self._T_tool_camera, T_base_tool
+                        )
+                        p_down = camera_to_base_link(
+                            cut_info["p_down_camera"], self._T_tool_camera, T_base_tool
+                        )
+                        # 当前工具姿态: T_base_tool 的旋转部分 = 工具轴在基系
+                        # 下的表示, ZYX 约定与 DOBOT MovL 一致
                         current_rpy = rotation_matrix_to_rpy_degrees(T_base_tool[:3, :3])
                         self._log(
-                            "[PICK] 果梗三点(camera): "
+                            "[PICK] 果梗三点(base): "
                             f"up=({p_up[0]:.3f},{p_up[1]:.3f},{p_up[2]:.3f}) "
                             f"cut=({p_cut[0]:.3f},{p_cut[1]:.3f},{p_cut[2]:.3f}) "
                             f"down=({p_down[0]:.3f},{p_down[1]:.3f},{p_down[2]:.3f})"
@@ -319,10 +327,30 @@ class PickFlowController:
                             f"[PICK] d 时刻臂姿 rpy=({current_rpy[0]:.1f},"
                             f"{current_rpy[1]:.1f},{current_rpy[2]:.1f})"
                         )
-                        pose = calculate_target_pose(p_up, p_cut, p_down, current_rpy)
-                        rpy_camera = (
-                            float(pose[3]), float(pose[4]), float(pose[5])
+
+                        p_arm = T_base_tool[:3, 3]          # 当前末端在基系中的位置
+
+
+                        current_z = T_base_tool[:3, 2]
+                        cut_pose = calculate_cut_pose(
+                            p_up,      # 果梗上点 U
+                            p_down,    # 果梗下点 D
+                            p_cut,     # 剪切点 C
+                            p_arm,     # 当前末端位置 E
+                            current_z, # 当前 TCP Z 轴方向
                         )
+                        pose = calculate_target_pose(p_up, p_cut, p_down, current_rpy)
+
+                        self._log(f"[PICK] cut_pose raw = {cut_pose!r}")
+                        self._log(f"[PICK] pose raw = {pose!r}")
+
+                        rpy_camera = (float(pose[5]), float(pose[4]), float(pose[3]))
+
+                        self._log(
+                            f"[PICK] rpy_camera(相机系) = "
+                            f"({rpy_camera[0]:.2f}, {rpy_camera[1]:.2f}, {rpy_camera[2]:.2f})"
+                        )
+
                         # 目标姿态从相机系转到机械臂基系再下发:
                         # R_base = R_base_camera @ R_camera,
                         # R_base_camera = (T_base_tool @ T_tool_camera)[:3,:3]
@@ -332,6 +360,12 @@ class PickFlowController:
                                 R_base_camera @ rpy_degrees_to_rotation_matrix(rpy_camera)
                             )
                         )
+
+                        self._log(
+                            f"[PICK] target_rpy(基系, 最终发送) = "
+                            f"({target_rpy[0]:.2f}, {target_rpy[1]:.2f}, {target_rpy[2]:.2f})"
+                        )
+
                         self._log(
                             f"[PICK] 动态剪切姿态(相机系) rx={rpy_camera[0]:.1f} "
                             f"ry={rpy_camera[1]:.1f} rz={rpy_camera[2]:.1f}"
@@ -378,8 +412,16 @@ class PickFlowController:
                 return
 
             # ── 运动与剪枝 ──
-            # 注: 不再做剪刀未就绪的 FAIL_CUT 门禁 — 剪刀不可用时
-            # 各执行段自行跳过剪枝 (仅运动 + 放果), 不阻断流程。
+            # 剪刀启用但通道未就绪 → 剪枝/放果段缺失, 完整采摘流程无法完成:
+            # MovL 直驱路径直接 FAIL_CUT, 不空跑运动段 (不动机器人);
+            # 话题模式仍发布 /target_pose 让臂走到目标 (现场验证位姿链路),
+            # 之后回 home 报 FAIL_CUT — 两种路径一律不报 DONE。
+            if not self._scissors_usable() and not self._send_via_topic:
+                self._fail(
+                    plc.STATE_FAIL_CUT,
+                    "剪刀启用但未就绪, 剪枝/放果段无法执行, 不启动采摘流程",
+                )
+                return
             if target_rpy is not None:
                 rx, ry, rz = target_rpy
             else:
@@ -409,7 +451,7 @@ class PickFlowController:
                 f"{target_base[2]:.3f})m rpy=({rx:.1f},{ry:.1f},{rz:.1f})"
             )
 
-            approach = self._offset(target_base, self._motion_cfg.get("approach_offset_m", [0.0, 0.0, 0.05]))
+            approach = self._offset(target_base, self._motion_cfg.get("approach_offset_m", [0.0, 0.0, 0.0]))
             place, place_rx, place_ry, place_rz = self._place_pose(target_base, rx, ry, rz)
 
             phases = [
@@ -443,12 +485,14 @@ class PickFlowController:
                     return
                 if result != "done":
                     if result == "no_motion":
+                        # 电机从未启动 → 剪刀未夹持, 跳过保安全开剪 (免空跑超时)
+                        self._scissors_closed = False
                         self._log("[PICK] 剪刀无动作 (0x02 未观察到运动), "
-                                  "合剪指令可能未生效")
+                                  "合剪指令未生效, 剪刀未夹持")
                     else:
                         self._log(f"[PICK] 合剪失败: {result}, 尽力开剪保安全")
-                    self._scissors_closed = True
-                    self._safety_open()
+                        self._scissors_closed = True
+                        self._safety_open()
                     cut_failed = True
                 else:
                     self._scissors_closed = True
@@ -539,6 +583,7 @@ class PickFlowController:
             result = self._robot.scissors_open_wait(
                 float(self._scissors_cfg.get("open_timeout_s", 5.0)),
                 threading.Event(),  # 保安全开剪不受 abort 影响
+                force=True,         # ROS 通道: 先清除未知锁存, 宁可开剪不滞留
             )
             self._log(f"[PICK] 保安全开剪: {result}")
             if result == "done":
@@ -608,11 +653,11 @@ class PickFlowController:
     def _return_home_and_wait(self) -> str:
         """话题模式流程收尾: 发布回初始位置并等待机械臂到位。
 
-        DONE 只有在机械臂回到 home (距 home ≤ auto_pick.home_radius_m)
-        之后才由调用方上报, 避免 PLC 在臂未复位时就发下一个 START。
-        超时 (motion.home_wait_timeout_s) 不阻断上报, 仅记日志。
+        DONE 只有在完整流程完成且机械臂回到 home (距 home ≤
+        auto_pick.home_radius_m) 之后才由调用方上报, 避免 PLC 在
+        臂未复位时就发下一个 START。
 
-        Returns: "done" (已到位 / 无需等待 / 超时容忍) | "aborted"
+        Returns: "done" (已到位 / 无需等待) | "timeout" (超时未到位) | "aborted"
         """
         home_xyz = self._motion_cfg.get("home_pose_xyz_m")
         home_quat = self._motion_cfg.get("home_quat_xyzw")
@@ -635,10 +680,10 @@ class PickFlowController:
                 return "aborted"
             T = self._robot.get_T_base_tool(max_age_s=2.0)
             if T is not None and float(np.linalg.norm(T[:3, 3] - home)) <= radius:
-                self._log("[PICK] 机械臂已回到初始位置 → 上报 DONE")
+                self._log("[PICK] 机械臂已回到初始位置")
                 return "done"
-        self._log(f"[PICK] 等待回初始位置超时 ({timeout_s:.0f}s), 照常上报")
-        return "done"
+        self._log(f"[PICK] 等待回初始位置超时 ({timeout_s:.0f}s), 机械臂未回初始位")
+        return "timeout"
 
     def _wait_arrival(self, target_base, rpy) -> str:
         """轮询机械臂位姿直到法兰到达目标 Link6 位姿（剪切点）。
@@ -660,13 +705,68 @@ class PickFlowController:
         R_target = rpy_degrees_to_rotation_matrix(rpy)
         link6_target = target - R_target @ self._gripper_offset_m
         deadline = time.time() + timeout_s
+        got_pose = 0
+        stale_cnt = 0
+        first_pos = None
+        last_pos = None
+        min_dist = None
         while time.time() < deadline:
             if self._abort_event.wait(poll):
                 return "aborted"
             T = self._robot.get_T_base_tool(max_age_s=2.0)
-            if T is not None and float(np.linalg.norm(T[:3, 3] - link6_target)) <= tol_m:
+            if T is None:
+                stale_cnt += 1
+                continue
+            got_pose += 1
+            pos = np.asarray(T[:3, 3], dtype=float)
+            if first_pos is None:
+                first_pos = pos.copy()
+            last_pos = pos.copy()
+            d = float(np.linalg.norm(pos - link6_target))
+            if min_dist is None or d < min_dist:
+                min_dist = d
+            if d <= tol_m:
                 return "arrived"
+        # 超时: 区分具体原因打印, 便于现场定位
+        if got_pose == 0:
+            reason = "全程未收到机械臂位姿 (位姿话题停更/机器人掉线)"
+        else:
+            moved_m = float(np.linalg.norm(last_pos - first_pos))
+            if moved_m < 0.005:
+                reason = (f"臂未动 (窗口内仅移动 {moved_m*1000:.0f}mm): "
+                          "规划/IK 失败或目标未被执行, 查 grape_arm_control 日志")
+            else:
+                reason = (f"臂在动但未入容差: 移动 {moved_m*1000:.0f}mm, "
+                          f"最近距目标 {min_dist*1000:.0f}mm > 容差 {tol_m*1000:.0f}mm "
+                          "(目标不可达/被挡/超时不足)")
+            reason += (f"; 实测终值=({last_pos[0]:.4f},{last_pos[1]:.4f},"
+                       f"{last_pos[2]:.4f})")
+        self._log(
+            f"[PICK] 到位等待超时 ({timeout_s:.0f}s): {reason}; "
+            f"期望 Link6=({link6_target[0]:.4f},{link6_target[1]:.4f},"
+            f"{link6_target[2]:.4f}); 位姿更新 {got_pose} 次 / 停更 {stale_cnt} 次"
+        )
         return "timeout"
+
+    def _wait_motion_started(self, from_pos, timeout_s: float = 5.0) -> None:
+        """轻量守卫: 等机械臂离开 from_pos (开始运动), 不判到位。
+
+        用途: 连续发布两个 /target_pose 时, grape_arm_control 只缓存最新
+        目标, 前一个未及时被消费会被覆盖丢弃; 观察到臂启动即说明前一个
+        目标已被执行, 此时发布下一个是安全的。超时仅记日志, 照常继续。
+        """
+        if self._robot is None:
+            return
+        poll = float(self._motion_cfg.get("poll_interval_s", 0.1))
+        ref = np.asarray(from_pos, dtype=float)
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self._abort_event.wait(poll):
+                return
+            T = self._robot.get_T_base_tool(max_age_s=2.0)
+            if T is not None and float(np.linalg.norm(T[:3, 3] - ref)) > 0.005:
+                return
+        self._log("[PICK] 回退后未观察到机械臂启动 (目标被覆盖/规划失败), 照常继续")
 
     # ── send_via_topic 模式时序: 发布位姿 → 到位判定合剪 → 固定点开剪 ──
     def _topic_pick_sequence(self, target_base, rpy) -> bool:
@@ -677,22 +777,45 @@ class PickFlowController:
 
         合剪改为闭环到位判定: 位姿未到达剪切点 (IK 失败/执行失败/位姿停更)
         时跳过合剪并上报 FAIL_ROBOT_MOTION, 避免空中误剪。
-        与 MovL 路径的差异: 本侧无后续运动可编排, 合剪失败即时报 FAIL_CUT
-        (MovL 路径则继续走放果/退回, 末尾统一上报)。
+        与 MovL 路径的差异: 本侧无后续运动可编排, 合剪失败安全开剪后
+        回 home 再报 FAIL_CUT (MovL 路径则继续走放果/退回, 末尾统一上报)。
 
         Returns:
-            True  = 流程正常走完 (调用方上报 DONE)
+            True  = 完整流程走完且机械臂已回初始位 (调用方上报 DONE)
             False = 已自行上报失败/中止, 调用方直接返回
         """
-        self._publish_target_pose(target_base, rpy)
-        self._log("[PICK] 已发布 /target_pose, 机械臂由 MoveIt 侧执行")
-
-        if not self._scissors_usable():
-            self._log("[PICK] 剪刀不可用, 跳过剪枝段")
+        approach_base = list(target_base)
+        approach_base[1] += 0.05
+        self._publish_target_pose(approach_base, rpy)
+        approach_arrival = self._wait_arrival(approach_base, rpy)
+        if approach_arrival == "aborted":
+            self._finish_aborted()
+            return False
+        if approach_arrival != "arrived":
+            self._log(f"[PICK] 机械臂未到达 approach 位置 ({approach_arrival}), 跳过合剪")
+            # 未到位同样先回 home, 避免机械臂停在半途
             if self._return_home_and_wait() == "aborted":
                 self._finish_aborted()
                 return False
-            return True
+            self._fail(
+                plc.STATE_FAIL_ROBOT_MOTION,
+                "机械臂未到达 approach 位置, 已跳过合剪",
+            )
+            return False
+        self._log("[PICK] 机械臂已到达 approach 位置")
+
+        self._publish_target_pose(target_base, rpy)
+        self._log("[PICK] 已发布 /target_pose, 机械臂由 MoveIt 侧执行")
+
+        # 剪刀未就绪 (入口门禁对话题模式放行): 臂已按发布位姿走到剪切点,
+        # 跳过剪枝/放果段, 回 home 后报 FAIL_CUT — 仍发送位姿但不报 DONE。
+        if not self._scissors_usable():
+            self._log("[PICK] 剪刀不可用, 跳过剪枝/放果段")
+            if self._return_home_and_wait() == "aborted":
+                self._finish_aborted()
+                return False
+            self._fail(plc.STATE_FAIL_CUT, "剪刀未就绪, 剪枝/放果段未执行")
+            return False
 
         # ── 合剪前到位判定: 轮询法兰是否到达剪切点对应 Link6 位姿 ──
         # 替代原 close_delay_s 开环延时: IK 失败/执行失败时机械臂不会到位,
@@ -703,6 +826,10 @@ class PickFlowController:
             return False
         if arrival != "arrived":
             self._log(f"[PICK] 机械臂未到达剪切点 ({arrival}), 跳过合剪")
+            # 未到位同样先回 home, 避免机械臂停在半途
+            if self._return_home_and_wait() == "aborted":
+                self._finish_aborted()
+                return False
             self._fail(
                 plc.STATE_FAIL_ROBOT_MOTION,
                 "机械臂未到达剪切点, 已跳过合剪",
@@ -714,7 +841,7 @@ class PickFlowController:
         if not self._pre_cut_idle_check():
             return False
 
-        # 合剪指令已下发 → 无论成败都按"可能已夹持"处理, 便于保安全开剪
+        # 合剪指令已下发 → 按"可能已夹持"处理, 便于保安全开剪
         self._scissors_closed = True
         result = self._robot.scissors_cut(
             float(self._scissors_cfg.get("cut_timeout_s", 15.0)),
@@ -727,14 +854,44 @@ class PickFlowController:
             return False
         if result != "done":
             if result == "no_motion":
+                # 电机从未启动 → 剪刀未夹持, 跳过保安全开剪 (免空跑超时)
+                self._scissors_closed = False
                 self._log("[PICK] 剪刀无动作 (0x02 未观察到运动), "
-                          "合剪指令可能未生效")
+                          "合剪指令未生效, 剪刀未夹持")
             else:
                 self._log(f"[PICK] 合剪失败: {result}, 尽力开剪保安全")
-            self._safety_open()
+                self._safety_open()
+            # 合剪失败同样先回 home: 与开剪失败同策略 (home 是安全位),
+            # 避免机械臂停在剪切点等人工
+            if self._return_home_and_wait() == "aborted":
+                self._finish_aborted()
+                return False
             self._fail(plc.STATE_FAIL_CUT, "合剪失败, 需人工确认剪刀与果藤状态")
             return False
         self._log("[PICK] 合剪完成 (夹持中)")
+
+        # ── 回退途经点: 合剪后沿接近方向回退 retract_offset_m, ──
+        #    避开枝条再平移放果 (z 保持剪切高度, 姿态不变, 开环无到位判定)
+        retract = [float(v) for v in self._motion_cfg.get("retract_offset_m", [0.0, 0.0, 0.0])]
+        if any(retract):
+            retract_pose = (
+                target_base[0] + retract[0],
+                target_base[1] + retract[1],
+                target_base[2] + retract[2],
+            )
+            ref_pos = None
+            if self._robot is not None:
+                T = self._robot.get_T_base_tool(max_age_s=2.0)
+                if T is not None:
+                    ref_pos = np.asarray(T[:3, 3], dtype=float)
+            self._publish_target_pose(retract_pose, rpy)
+            self._log(
+                f"[PICK] 已发布回退途经点 /target_pose: 剪切点 + "
+                f"({retract[0]:.2f},{retract[1]:.2f},{retract[2]:.2f})m (开环, 无到位判定)"
+            )
+            # 轻量守卫: 等臂开始运动 (防止放果点发布过快覆盖回退目标)
+            if ref_pos is not None:
+                self._wait_motion_started(ref_pos)
 
         # ── 固定放果点 → 开剪 ──
         # ⚠ 固定位置待现场示教: 在 configs/fusion_pipeline.yaml 填
@@ -743,11 +900,16 @@ class PickFlowController:
         #   填好后本段自动生效; 留空 (null) 则跳过, 剪刀保持合剪到下一轮或 ABORT。
         fixed = self._motion_cfg.get("place_position_mm")
         if not fixed:
-            self._log("[PICK] 未配置固定放果点 place_position_mm, 跳过开剪 (剪刀保持合剪)")
+            self._log("[PICK] 未配置固定放果点 place_position_mm → "
+                      "放果/开剪段缺失, 不报 DONE")
             if self._return_home_and_wait() == "aborted":
                 self._finish_aborted()
                 return False
-            return True
+            self._fail(
+                plc.STATE_FAIL_CUT,
+                "未配置固定放果点 place_position_mm, 放果/开剪段未执行",
+            )
+            return False
 
         fixed = [float(v) for v in fixed]
         place = (fixed[0] / 1000.0, fixed[1] / 1000.0, fixed[2] / 1000.0)
@@ -773,12 +935,25 @@ class PickFlowController:
         if result != "done":
             if result == "no_motion":
                 self._log("[PICK] 开剪无动作 (0x02 未观察到运动), 指令可能未生效")
+            # 开剪失败不挡住回家: home 是安全位, 先回 home 再报 FAIL_CUT
+            self._log(f"[PICK] 开剪失败: {result} — 先回 home 再报 FAIL_CUT")
+            if self._return_home_and_wait() == "aborted":
+                self._finish_aborted()
+                return False
             self._fail(plc.STATE_FAIL_CUT, f"开剪失败: {result}, 剪刀状态未知")
             return False
         self._scissors_closed = False
         self._log("[PICK] 开剪完成 (放果)")
-        if self._return_home_and_wait() == "aborted":
+        home_result = self._return_home_and_wait()
+        if home_result == "aborted":
             self._finish_aborted()
+            return False
+        if home_result != "done":
+            # 完整流程已走完但机械臂未回初始位: 不报 DONE
+            self._fail(
+                plc.STATE_FAIL_ROBOT_MOTION,
+                "采摘流程完成但机械臂未回到初始位置, 不报 DONE",
+            )
             return False
         return True
 

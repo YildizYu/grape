@@ -6,15 +6,19 @@
 R 的列是工具坐标轴在基坐标系中的表达。
 
 工具坐标系：TCP 位于实际剪切位置；+X 指向刀口前方；+Z 是切割
-平面法向，与 D -> U 同向；+Y 按右手规则确定。这是该工具坐标系的
-目标姿态；若控制器使用法兰坐标系或其他工具轴，需先做安装变换，
-不能直接将此输出作为法兰位姿。四个位置本身无法推断安装变换。
+平面法向（current_z 提供时保持当前 TCP Z 轴方向）；+Y 按右手规则确定。
+这是该工具坐标系的目标姿态；若控制器使用法兰坐标系或其他工具轴，
+需先做安装变换，不能直接将此输出作为法兰位姿。四个位置本身无法推断
+安装变换。
 
 Python:
+    # 现场版 (保持当前 TCP Z 轴方向):
+    pose = calculate_cut_pose(U, D, C, E, current_z)
+    # 旧四点法 (Z 取果梗方向 D→U):
     pose = calculate_cut_pose(U, D, C, E)
 CLI:
-    python3 vector/calculate_cut_pose.py --u 0 0 1 --d 0 0 -1 \
-        --c 0 0 0 --e -1 0 0
+    python3 src/grape_stem_3d/calculate_cut_pose.py --u 0 0 1 --d 0 0 -1 \
+        --c 0 0 0 --e -1 0 0 --z 0 0 1
 """
 
 import argparse
@@ -49,24 +53,82 @@ def _cross(a, b):
             a[0]*b[1] - a[1]*b[0])
 
 
-def calculate_cut_rotation(U, D, C, E):
-    """返回 3×3 目标工具旋转矩阵（嵌套列表），用于检查或其他姿态格式。"""
+def calculate_cut_rotation(U, D, C, E, current_z=None):
+    """返回 3×3 目标工具旋转矩阵（列向量 = 工具 X/Y/Z 轴）。
+
+    current_z 提供（现场 5 参版，与 Box 一致）:
+        - Z 轴保持当前机械臂 TCP 的 Z 轴方向；
+        - -Y 为夹爪朝向果梗的方向，并保证其垂直于果梗；
+        - X 由右手系确定（X = Y × Z）。
+    current_z 为 None（旧四点法，兼容旧测试/旧调用）:
+        - Z 取果梗方向 D→U；
+        - X 取接近方向在垂直果梗平面内的投影；
+        - Y = Z × X。
+
+    参数:
+        U, D : 果梗上/下点，D -> U 为果梗方向
+        C    : 剪切点
+        E    : 当前末端位置
+        current_z : 当前 TCP 的 Z 轴方向（3 维向量，可选）
+
+    返回:
+        3×3 嵌套列表，列为工具坐标系的 X/Y/Z 轴。
+    """
     upper, lower, cut, current = (
         _vector3(value, name)
         for value, name in ((U, "U"), (D, "D"), (C, "C"), (E, "E"))
     )
-    # 切割平面法向：从下点指向上点。
-    z = _unit(_subtract(upper, lower), "U-D")
+    stem = _unit(_subtract(upper, lower), "U-D")
+
+    if current_z is None:
+        # ── 旧四点法: 无当前 Z, 工具 Z 取果梗方向 ──
+        approach = _unit(_subtract(cut, current), "C-E")
+        # 将接近方向投影到垂直于果梗的平面。
+        parallel = sum(a*b for a, b in zip(approach, stem))
+        projected = tuple(a - parallel*b for a, b in zip(approach, stem))
+        if math.hypot(*projected) < 1e-10:
+            raise ValueError("接近方向与果梗平行，无法由这四个点确定刀口朝向")
+        x = _unit(projected, "刀口朝向")
+        y = _unit(_cross(stem, x), "工具 Y 轴")
+        x = _unit(_cross(y, stem), "工具 X 轴")
+        return [[x[i], y[i], stem[i]] for i in range(3)]
+
+    # ── 现场 5 参版: 保持当前机械臂 TCP 的 Z 轴方向 ──
+    z = _unit(_vector3(current_z, "current_z"), "current_z")
+    # 当前末端 -> 剪切点，用于确定夹爪朝向的正负
     approach = _unit(_subtract(cut, current), "C-E")
-    # 将接近方向投影到垂直于果梗的平面。
-    parallel = sum(a*b for a, b in zip(approach, z))
-    projected = tuple(a - parallel*b for a, b in zip(approach, z))
-    if math.hypot(*projected) < 1e-10:
-        raise ValueError("接近方向与果梗平行，无法由这四个点确定刀口朝向")
-    x = _unit(projected, "刀口朝向")
-    y = _unit(_cross(z, x), "工具 Y 轴")
-    x = _unit(_cross(y, z), "工具 X 轴")
-    return [[x[i], y[i], z[i]] for i in range(3)]
+    # Y 轴必须同时垂直于:
+    #   1. TCP Z 轴
+    #   2. 果梗方向
+    y_candidate = _cross(z, stem)
+    if math.hypot(*y_candidate) < 1e-10:
+        # 当前 Z 与果梗近似平行，单靠 z 和 stem 无法确定 Y，
+        # 此时使用接近方向在垂直 z 平面内的投影来定 -Y。
+        parallel = sum(a * b for a, b in zip(approach, z))
+        projected = tuple(
+            a - parallel * b
+            for a, b in zip(approach, z)
+        )
+        if math.hypot(*projected) < 1e-10:
+            raise ValueError(
+                "当前Z轴与果梗方向近似平行，且接近方向无法确定工具Y轴"
+            )
+        # -Y 朝向剪切点
+        minus_y = _unit(projected, "夹爪切入方向")
+        y = tuple(-v for v in minus_y)
+    else:
+        y = _unit(y_candidate, "工具Y轴")
+        # ±Y 都满足垂直条件，选择让 -Y 更接近
+        # “当前末端 -> 剪切点”的那个方向。
+        minus_y = tuple(-v for v in y)
+        if sum(a * b for a, b in zip(minus_y, approach)) < 0.0:
+            y = tuple(-v for v in y)
+    # 右手坐标系：X = Y × Z
+    x = _unit(_cross(y, z), "工具X轴")
+    return [
+        [x[i], y[i], z[i]]
+        for i in range(3)
+    ]
 
 
 def _rotation_to_rpy_degrees(r):
@@ -82,15 +144,31 @@ def _rotation_to_rpy_degrees(r):
     return [math.degrees(a) for a in (roll, pitch, yaw)]
 
 
-def calculate_cut_pose(U, D, C, E):
-    """输入四个 [x,y,z]，输出 [x,y,z,roll,pitch,yaw]，角度为度。
+def calculate_cut_pose(U, D, C, E, current_z=None):
+    """由 U/D/C/E（及可选当前 TCP Z 轴）计算切割位姿。
 
-    U: 果梗上点；D: 果梗下点；C: 剪切点；E: 当前末端位置。
-    XYZ 直接取 C；当前 RPY 不参与计算。工具轴定义见文件开头。
-    无效坐标或不能确定方向时抛出 ValueError。
+    参数:
+        U, D : 果梗上/下点，D -> U 为果梗方向
+        C    : 剪切点
+        E    : 当前末端位置
+        current_z : 当前 TCP 的 Z 轴方向（3 维向量，可选;
+                    提供则保持该方向, 与现场 Box 版一致）
+
+    返回:
+        [x, y, z, roll, pitch, yaw]
+        其中 (x, y, z) 为剪切点 C 的位置，
+        (roll, pitch, yaw) 为由 calculate_cut_rotation 得到的姿态角（度）。
     """
     cut = _vector3(C, "C")
-    rotation = calculate_cut_rotation(U, D, cut, E)
+
+    rotation = calculate_cut_rotation(
+        U,
+        D,
+        cut,
+        E,
+        current_z,
+    )
+
     return list(cut) + _rotation_to_rpy_degrees(rotation)
 
 
@@ -101,9 +179,12 @@ def main():
                               ("c", "剪切点"), ("e", "当前末端位置")):
         parser.add_argument(f"--{name}", nargs=3, type=float, required=True,
                             metavar=("X", "Y", "Z"), help=description)
+    parser.add_argument("--z", nargs=3, type=float, default=None,
+                        metavar=("X", "Y", "Z"),
+                        help="可选: 当前 TCP Z 轴方向 (提供则保持该方向, 现场版)")
     args = parser.parse_args()
     try:
-        pose = calculate_cut_pose(args.u, args.d, args.c, args.e)
+        pose = calculate_cut_pose(args.u, args.d, args.c, args.e, args.z)
     except ValueError as exc:
         parser.error(str(exc))
     print(json.dumps(pose, allow_nan=False))

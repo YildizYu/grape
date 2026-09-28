@@ -96,8 +96,12 @@ class DobotClient:
         self._prefix = robot_cfg.get("service_prefix", "/dobot_bringup_ros2/srv")
         self._service_timeout_s = float(robot_cfg.get("service_timeout_s", 5.0))
 
-        # 剪刀手传输通道: scissors.port 配置 (如 /dev/ttyUSB0) → USB转485 直连;
-        # 留空 → 机械臂末端 485 Modbus 链 (SetSingleHoldReg)
+        # 剪刀手传输通道优先级:
+        #   scissors.service_name 配置 → ROS 服务通道 (GHC scissor_control_node)
+        #   scissors.port 配置 (如 /dev/ttyUSB0) → USB转485 直连
+        #   均留空 → 机械臂末端 485 Modbus 链 (SetSingleHoldReg)
+        self._scissors_service_name = (
+            self._cfg.get("scissors", {}).get("service_name") or None)
         self._scissors_port = self._cfg.get("scissors", {}).get("port") or None
 
         # ── 服务 client ─────────────────────────────
@@ -141,6 +145,7 @@ class DobotClient:
         self._modbus_index: Optional[int] = None  # ModbusRTUCreate 返回的主站 index
         self._scissors_ready = False
         self._scissors485 = None  # Scissors485 实例 (tty 模式)
+        self._scissors_ros = None  # ScissorServiceClient 实例 (ROS 服务通道)
 
     # ── 订阅回调（executor 线程）──────────────────
     def _on_tool_vector(self, msg: ToolVectorActual):
@@ -448,14 +453,18 @@ class DobotClient:
 
     # ── 剪刀手 Modbus 链 ───────────────────────────
     def initialize_scissors(self) -> bool:
-        """初始化末端 485 + Modbus 主站（一次，程序启动时调用）。
+        """初始化剪刀手通道（一次，程序启动时调用）。
 
-        序列: SetToolPower(1) → SetToolMode(1,0) → SetTool485(9600)
-              → ModbusRTUCreate(1,9600,'"N"',8,1) → 写速度(0x04)/行程(0x05)
-
-        若配置 scissors.port (如 /dev/ttyUSB0): 改为 USB转485 直连剪刀手
-        (Scissors485), 不走机械臂末端 485 链。
+        通道优先级:
+        1. 配置 scissors.service_name → ROS 服务通道 (/scissor/set_state,
+           GHC scissor_control_node 独占剪刀 RS485, 本侧阻塞等待返回)
+        2. 配置 scissors.port (如 /dev/ttyUSB0) → USB转485 直连 (Scissors485)
+        3. 均未配置 → 机械臂末端 485 Modbus 链:
+           SetToolPower(1) → SetToolMode(1,0) → SetTool485(9600)
+           → ModbusRTUCreate(1,9600,'"N"',8,1) → 写速度(0x04)/行程(0x05)
         """
+        if self._scissors_service_name:
+            return self._init_scissors_ros()
         if self._scissors_port:
             return self._init_scissors_tty()
         sc = self._cfg.get("scissors", {})
@@ -509,6 +518,11 @@ class DobotClient:
 
     @property
     def scissors_ready(self) -> bool:
+        if self._scissors_ros is not None:
+            # 锁存未知时不隐藏通道: 让动作路径显式失败并报 FAIL_CUT,
+            # 避免静默跳过剪枝; 仅服务未上线时才报告不可用。
+            return (self._scissors_ros.is_ready()
+                    or self._scissors_ros.state_unknown)
         return self._scissors_ready
 
     # ── 剪刀手 USB转485 直连通道 ───────────────────────
@@ -540,8 +554,80 @@ class DobotClient:
             self._log(f"[SCISSORS] 直连初始化异常: {e!r}")
             return False
 
+    # ── 剪刀手 ROS 服务通道 (GHC scissor_control_node) ──
+    def _init_scissors_ros(self) -> bool:
+        """ROS 服务通道初始化: 创建 /scissor/set_state 客户端。
+
+        剪刀 RS485 由 GHC 的 C++ 节点独占, 速度/行程寄存器配置与
+        0x02 判停都在 C++ 端完成, 本侧 close()/open() 阻塞等待返回。
+        """
+        from grape_stem_3d.scissor_service_client import ScissorServiceClient
+
+        sc = self._cfg.get("scissors", {})
+        try:
+            self._scissors_ros = ScissorServiceClient(
+                self._node,
+                timeout_sec=float(sc.get("service_timeout_s", 25.0)),
+                service_name=self._scissors_service_name,
+            )
+        except Exception as e:
+            self._log(f"[SCISSORS] ROS 服务客户端创建失败: {e!r}")
+            return False
+        self._scissors_ready = True
+        if self._scissors_ros.wait_ready(timeout_sec=3.0):
+            self._log(f"[SCISSORS] ROS 服务通道就绪: {self._scissors_service_name}")
+        else:
+            self._log(f"[SCISSORS] ROS 服务暂未上线 ({self._scissors_service_name}), "
+                      f"上线后自动可用")
+        return True
+
+    def _ros_action(self, action: str, timeout_s: Optional[float],
+                    abort_event: Optional[threading.Event],
+                    force: bool = False) -> str:
+        """ROS 通道动作适配: 阻塞等待 C++ 端完成, 映射为流程返回码。
+
+        0x02 判停在 C++ 端完成, 本侧无需轮询; 结果映射:
+        "done" | "no_motion" | "timeout" | "aborted" | "error"
+        force=True (保安全开剪) 先清除未知锁存再执行 —— 合剪失败/ABORT
+        时宁可开剪, 不夹持果梗滞留 (pick_flow 既定策略)。
+        """
+        from grape_stem_3d.scissor_service_client import (
+            ScissorError,
+            ScissorStateUnknown,
+        )
+
+        client = self._scissors_ros
+        if force:
+            client.reset()
+        try:
+            fn = client.close if action == "close" else client.open
+            fn(abort_event)
+            return "done"
+        except ScissorStateUnknown as exc:
+            msg = str(exc)
+            if abort_event is not None and abort_event.is_set():
+                return "aborted"
+            # C++ 侧 message 为英文大写开头 ("No motion detected..." /
+            # "Timeout: ..."), 小写化后再匹配, 避免超时类失败被误归为 "error"
+            if "no motion" in msg.lower():
+                return "no_motion"
+            if "超时" in msg or "timeout" in msg.lower():
+                return "timeout"
+            return "error"
+        except ScissorError as exc:
+            msg = str(exc)
+            if abort_event is not None and abort_event.is_set():
+                return "aborted"
+            self._log(f"[SCISSORS] ROS 通道动作失败: {msg}")
+            return "error"
+        except Exception as exc:
+            self._log(f"[SCISSORS] ROS 通道动作异常: {exc!r}")
+            return "error"
+
     def scissors_close(self) -> bool:
         """合剪（0x01 写 4）: 电机轴伸出剪断果梗。"""
+        if self._scissors_ros is not None:
+            return self._ros_action("close", None, None) == "done"
         if self._scissors485 is not None:
             return self._scissors485.scissors_close()
         sc = self._cfg.get("scissors", {})
@@ -550,12 +636,18 @@ class DobotClient:
 
     def scissors_open(self) -> bool:
         """开剪（0x0A 写 1）: 电机轴缩回放果。"""
+        if self._scissors_ros is not None:
+            return self._ros_action("open", None, None) == "done"
         if self._scissors485 is not None:
             return self._scissors485.scissors_open()
         return self._write_reg(int(self._cfg.get("scissors", {}).get("reg_open", 10)), 1)
 
     def scissors_busy(self) -> Optional[int]:
         """读 0x02 运动状态寄存器: 1=运动中, 0=已停止, None=读取失败。"""
+        if self._scissors_ros is not None:
+            # ROS 通道由 C++ 节点内部判停且服务调用串行化, 无独立状态
+            # 可读, 视为空闲放行 (合剪前到位判定等流程仍照常执行)。
+            return 0
         if self._scissors485 is not None:
             return self._scissors485.scissors_busy()
         return self._read_reg(int(self._cfg.get("scissors", {}).get("reg_motion", 2)))
@@ -570,6 +662,8 @@ class DobotClient:
         """
         sc = self._cfg.get("scissors", {})
         start_grace = float(sc.get("start_grace_s", 1.0))
+        if self._scissors_ros is not None:
+            return self._ros_action("close", timeout_s, abort_event)
         if self._scissors485 is not None:
             return self._scissors485.scissors_cut(
                 timeout_s, abort_event, start_grace_s=start_grace
@@ -585,10 +679,17 @@ class DobotClient:
             timeout_s, abort_event, interval, start_grace
         )
 
-    def scissors_open_wait(self, timeout_s: float, abort_event: threading.Event) -> str:
-        """开剪并等待完成（0x0A → 轮询 0x02, 判据同合剪）。"""
+    def scissors_open_wait(self, timeout_s: float, abort_event: threading.Event,
+                           force: bool = False) -> str:
+        """开剪并等待完成（0x0A → 轮询 0x02, 判据同合剪）。
+
+        force=True: 仅 ROS 通道生效, 先清除未知锁存再开剪 —— 供保安全
+        开剪使用 (合剪失败/ABORT 时宁可开剪, 不夹持果梗滞留)。
+        """
         sc = self._cfg.get("scissors", {})
         start_grace = float(sc.get("start_grace_s", 1.0))
+        if self._scissors_ros is not None:
+            return self._ros_action("open", timeout_s, abort_event, force=force)
         if self._scissors485 is not None:
             return self._scissors485.scissors_open_wait(
                 timeout_s, abort_event, start_grace_s=start_grace
